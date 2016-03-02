@@ -1,6 +1,7 @@
 import asyncio
 from unittest import TestCase
 from datetime import datetime, timedelta
+import time
 
 from qcodes.instrument.base import Instrument
 from qcodes.instrument.mock import MockInstrument
@@ -10,6 +11,7 @@ from qcodes.instrument.parameter import ManualParameter
 
 from qcodes.utils.validators import Numbers, Ints, Strings, MultiType, Enum
 from qcodes.utils.sync_async import wait_for_async, NoCommandError
+from qcodes.utils.helpers import LogCapture
 
 
 class ModelError(Exception):
@@ -149,9 +151,55 @@ class TestParameters(TestCase):
 
         self.init_ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
+    def slow_neg_set(self, val):
+        if val < 0:
+            time.sleep(0.05)
+        self.gates.chan0.set(val)
+
+    def test_slow_set(self):
+        self.gates.add_parameter('chan0slow', get_cmd='c0?',
+                                 set_cmd=self.slow_neg_set, get_parser=float,
+                                 vals=Numbers(-10, 10), sweep_step=0.2,
+                                 sweep_delay=0.01)
+        self.gates.add_parameter('chan0slow2', get_cmd='c0?',
+                                 set_cmd=self.slow_neg_set, get_parser=float,
+                                 vals=Numbers(-10, 10), sweep_step=0.2,
+                                 sweep_delay=0.01, max_sweep_delay=0.02)
+        self.gates.add_parameter('chan0slow3', get_cmd='c0?',
+                                 set_cmd=self.slow_neg_set, get_parser=float,
+                                 vals=Numbers(-10, 10), sweep_step=0.2,
+                                 sweep_delay=0.01, max_sweep_delay=0.06)
+
+        for param, logcount in (('chan0slow', 2), ('chan0slow2', 2),
+                                ('chan0slow3', 0)):
+            self.gates.chan0.set(-0.5)
+
+            with LogCapture() as s:
+                self.gates.set(param, 0.5)
+
+            logs = s.getvalue().split('\n')[:-1]
+            s.close()
+
+            self.assertEqual(len(logs), logcount, logs)
+            for line in logs:
+                self.assertTrue(line.startswith('negative delay'), line)
+
     def check_ts(self, ts_str):
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         self.assertTrue(self.init_ts <= ts_str <= now)
+
+    def test_instances(self):
+        for instrument in [self.gates, self.source, self.meter]:
+            self.assertIn(instrument, self.gates.instances())
+
+        # somehow instances never go away... there are always 3
+        # extra references to every instrument object, so del doesn't
+        # work. I guess for this reason, instrument tests should take
+        # the *last* instance to test.
+        # instancelen = len(self.gates.instances())
+
+        # del self.source
+        # self.assertEqual(len(self.gates.instances()), instancelen - 1)
 
     def test_mock_instrument(self):
         gates, source, meter = self.gates, self.source, self.meter
@@ -284,6 +332,19 @@ class TestParameters(TestCase):
         with self.assertRaises(TypeError):
             gates.add_parameter('fugacity', set_cmd='f {:.4f}', vals=[1, 2, 3])
 
+    def check_set_amplitude2(self, val, log_count, history_count):
+        source = self.source
+        with LogCapture() as s:
+            source.amplitude2.set(val)
+
+        logs = s.getvalue().split('\n')[:-1]
+        s.close()
+
+        self.assertEqual(len(logs), log_count, logs)
+        for line in logs:
+            self.assertIn('cannot sweep', line.lower())
+        self.assertEqual(len(source.history), history_count)
+
     def test_sweep_steps_edge_case(self):
         # MultiType with sweeping is weird - not sure why one would do this,
         # but we should handle it
@@ -293,14 +354,20 @@ class TestParameters(TestCase):
                              vals=MultiType(Numbers(0, 1), Strings()),
                              sweep_step=0.2, sweep_delay=0.005)
         self.assertEqual(len(source.history), 0)
-        source.set('amplitude2', 'Off')
-        self.assertEqual(len(source.history), 2)  # get then set
-        source.set('amplitude2', 0.2)
-        self.assertEqual(len(source.history), 3)  # single set
-        source.set('amplitude2', 0.8)  # num -> num is the only real sweep
-        self.assertEqual(len(source.history), 6)  # 3-step sweep
-        source.set('amplitude2', 'Off')
-        self.assertEqual(len(source.history), 7)  # single set
+
+        # 2 history items - get then set, and one warning (cannot sweep
+        # number to string value)
+        self.check_set_amplitude2('Off', log_count=1, history_count=2)
+
+        # one more history item - single set, and one warning (cannot sweep
+        # string to number)
+        self.check_set_amplitude2(0.2, log_count=1, history_count=3)
+
+        # the only real sweep (0.2 to 0.8) adds 3 set's to history and no logs
+        self.check_set_amplitude2(0.8, log_count=0, history_count=6)
+
+        # single set added to history, and another sweep warning num->string
+        self.check_set_amplitude2('Off', log_count=1, history_count=7)
 
     def test_set_sweep_errors(self):
         gates = self.gates
@@ -387,7 +454,7 @@ class TestParameters(TestCase):
 
     def test_standard_snapshot(self):
         self.assertEqual(self.meter.snapshot(), {
-            'parameters': {'amplitude': {}},
+            'parameters': {'amplitude': {'value': None, 'ts': None}},
             'functions': {'echo': {}}
         })
 
@@ -403,11 +470,42 @@ class TestParameters(TestCase):
         noise = self.source.noise
 
         self.assertEqual(self.source.snapshot()['parameters']['noise'],
-                         {'value': None})
+                         {'value': None, 'ts': None})
 
         noise.set(100)
-        self.assertEqual(self.source.snapshot()['parameters']['noise'],
-                         {'value': 100})
+        noisesnap = self.source.snapshot()['parameters']['noise']
+        self.assertEqual(noisesnap['value'], 100)
+
+        noise_ts = datetime.strptime(noisesnap['ts'], '%Y-%m-%d %H:%M:%S')
+        self.assertLessEqual(noise_ts, datetime.now())
+        self.assertGreater(noise_ts, datetime.now() - timedelta(seconds=1.1))
+
+    def tests_get_latest(self):
+        self.source.add_parameter('noise', parameter_class=ManualParameter)
+        noise = self.source.noise
+
+        self.assertIsNone(noise.get_latest())
+
+        noise.set(100)
+
+        mock_ts = datetime(2000, 3, 4)
+        ts_str = mock_ts.strftime('%Y-%m-%d %H:%M:%S')
+        noise._last_ts = mock_ts
+        self.assertEqual(noise.snapshot()['ts'], ts_str)
+
+        self.assertEqual(noise.get_latest(), 100)
+        self.assertEqual(noise.get_latest.get(), 100)
+        self.assertEqual(wait_for_async(noise.get_latest.get_async), 100)
+
+        # get_latest should not update ts
+        self.assertEqual(noise.snapshot()['ts'], ts_str)
+
+        # get_latest is not settable
+        with self.assertRaises(AttributeError):
+            noise.get_latest.set(50)
+
+        with self.assertRaises(AttributeError):
+            wait_for_async(noise.get_latest.set_async, 10)
 
     def test_mock_read(self):
         gates, meter = self.gates, self.meter
