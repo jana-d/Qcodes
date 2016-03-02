@@ -17,18 +17,17 @@ class QDac(VisaInstrument):
     Tested with Software Version: 0.160218
     '''
 
-    num_chans = 48
+    # 2^28 - 1 - a few cmds go up to 2^31 - 1 but we should never need this.
+    max_int = 268435455
     voltage_range_map = {10: 0, 1: 1}  # +/- 10V or +/- 1V
     voltage_range_status = {'X 1': 10, 'X 0.1': 1}
 
     current_range_map = {'pA': 0, 'nA': 1}
 
-    channel_validator = vals.Ints(1, num_chans)
-
     # set nonzero value (seconds) to accept older status when reading settings
     max_status_age = 1
 
-    def __init__(self, name, address):
+    def __init__(self, name, address, num_chans=48):
         super().__init__(name, address)
         handle = self.visa_handle
 
@@ -42,13 +41,16 @@ class QDac(VisaInstrument):
         handle.write_termination = '\n'
         # TODO: do we need a query delay for robust operation?
 
+        self.num_chans = num_chans
+
         self.add_function('get_status', call_cmd=self._get_status)
 
         self.chan_range = range(1, 1 + self.num_chans)
+        self.channel_validator = vals.Ints(1, self.num_chans)
 
         for i in self.chan_range:
             stri = str(i)
-            self.add_parameter(name='chan' + stri,
+            self.add_parameter(name='v' + stri,
                                label='Channel ' + stri,
                                units='V',
                                set_cmd='set ' + stri + ' {:.6f}',
@@ -66,7 +68,7 @@ class QDac(VisaInstrument):
                                label='Current ' + stri,
                                units='A',
                                get_cmd='get ' + stri,
-                               get_parser=float)
+                               get_parser=self._num_verbose)
 
         for board in range(6):
             for sensor in range(3):
@@ -75,7 +77,7 @@ class QDac(VisaInstrument):
                                    label=label,
                                    units='C',
                                    get_cmd='tem {} {}'.format(board, sensor),
-                                   get_parser=float)
+                                   get_parser=self._num_verbose)
 
         self.add_parameter(name='cal',
                            set_cmd='cal {}',
@@ -91,14 +93,15 @@ class QDac(VisaInstrument):
             vals.Numbers(-10, 10),  # amplitude
             vals.Numbers(-10, 10)  # offset
         ]
-        function_params = [
-            vals.Ints(1, 8),  # waveform slots
-            vals.Numbers(1, 268435455),  # period, in milliseconds TODO: check
-            vals.Numbers(0, 100)  # duty cycle (not for sin)
-        ]
         self.add_function(name='set_waveform',
                           call_cmd='wav {} {} {} {}',
                           parameters=waveform_params)
+
+        function_params = [
+            vals.Ints(1, 8),  # waveform slots
+            vals.Ints(1, self.max_int),  # period, in milliseconds TODO: check
+            vals.Numbers(0, 100)  # duty cycle (not for sin)
+        ]
         self.add_function(name='create_sin',
                           call_cmd='fun {} 1 {}',
                           parameters=function_params[:2])
@@ -108,6 +111,7 @@ class QDac(VisaInstrument):
         self.add_function(name='create_triangle',
                           call_cmd='fun {} 3 {} {}',
                           parameters=function_params)
+
         self.add_function(name='create_raw_awg',
                           call_cmd=self._raw_awg,
                           parameters=[vals.Anything()])
@@ -116,20 +120,52 @@ class QDac(VisaInstrument):
                           parameters=[vals.Anything()])
         self.add_function(name='create_spline_awg',
                           call_cmd=self._spline_awg,
-                          parameters=[vals.Numbers(1, 268435455),
+                          parameters=[vals.Numbers(1, self.max_int),
                                       vals.Anything()])
 
-        # self.add_function
+        pulse_params = [
+            # low and high times in milliseconds
+            vals.Ints(1, self.max_int),
+            vals.Ints(1, self.max_int),
+            # low and high values in volts
+            vals.Numbers(-10, 10),
+            vals.Numbers(-10, 10),
+            # pulse count (0 is forever)
+            vals.Ints(0, self.max_int)
+        ]
+        self.add_function(name='create_pulses',
+                          call_cmd='pul {} {} {} {} {}',
+                          parameters=pulse_params)
+
+        sync_params = [
+            # sync outputs - command supports 6 but 6th is given up
+            # for the calibration port
+            vals.Ints(1, 5),
+            # which function generator (1-8 are funcs, 9 is awg, 10 is pulse)
+            vals.Ints(1, 10),
+            vals.Ints(0, self.max_int),  # msec delay vs start of waveform
+            vals.Ints(1, self.max_int),  # pulse length, in milliseconds
+            # repetitions is currently broken - TODO reinstate when Rikke fixes
+            # vals.Ints(0, 1000000000)  # repetitions (0 means forever)
+        ]
+        self.add_function(name='set_sync_pulse',
+                          call_cmd='syn {} {} {} {}',
+                          parameters=sync_params)
+
+        self.add_function(name='soft_sync',
+                          call_cmd=self._soft_sync,
+                          parameters=[vals.Ints(1, 10)])
 
         # not to be implemented:
         # boa, tri (service), val, upd, sin (obsolete)
 
         # not implemented yet:
-        # syn, ssy, pul
         # nice interface to waveforms
 
         self.verbose.set(False)
         self.get_status()
+        print('connected to QDac on {}, firmware version {}'.format(
+            self._address, self.version))
 
     def _num_verbose(self, s):
         '''
@@ -137,8 +173,14 @@ class QDac(VisaInstrument):
         If the QDac is in verbose mode, this involves stripping off the
         value descriptor.
         '''
+        if self.verbose.get_latest():
+            s = s.split[': '][-1]
+        return float(s)
 
     def read_state(self, chan, param):
+        '''
+        specific routine for reading items out of status response
+        '''
         if chan not in self.chan_range:
             raise ValueError('valid channels are {}'.format(self.chan_range))
         valid_params = ('v', 'vrange', 'irange')
@@ -146,14 +188,12 @@ class QDac(VisaInstrument):
             raise ValueError(
                 'read_state valid params are {}'.format(valid_params))
 
-        if (self.max_status_age and (
+        if not (self.max_status_age and (
                     datetime.now() - self._status_ts
                 ).total_seconds() < self.max_status_age):
-            chans = self._status
-        else:
-            chans = self.get_status()
+            self.get_status()
 
-        return chans[chan - 1][param]
+        return self.parameters[param + str(chan)].get_latest()
 
     def _get_status(self):
         r'''
@@ -176,7 +216,6 @@ class QDac(VisaInstrument):
         version_line = self.ask('status')
         if version_line.startswith('Software Version: '):
             self.version = version_line.strip().split(': ')[1]
-            print('QDac - ' + version_line.strip())
         else:
             self._wait_and_clear()
             raise ValueError('unrecognized version line: ' + version_line)
@@ -194,12 +233,19 @@ class QDac(VisaInstrument):
             line = self.read().strip()
             if not line:
                 continue
-            chan, v, _, vrange, _, irange = line.split('\t')
-            chan = int(chan)
-            v = float(v)
-            vrange = self.voltage_range_status[vrange.strip()]
+            chanstr, v, _, vrange, _, irange = line.split('\t')
+            chan = int(chanstr)
 
-            chans[chan - 1] = {'v': v, 'vrange': vrange, 'irange': irange}
+            vals_dict = {
+                'v': float(v),
+                'vrange': self.voltage_range_status[vrange.strip()],
+                'irange': irange
+            }
+
+            chans[chan - 1] = vals_dict
+            for param, val in vals_dict.items():
+                self.parameters[param + chanstr]._save_val(val)
+
             chans_left.remove(chan)
 
         self._status = chans
@@ -227,6 +273,15 @@ class QDac(VisaInstrument):
 
     def _spline_awg(self, interval, data):
         self._write_awg(2, interval, data)
+
+    def _soft_sync(self, func_gen):
+        self.ask('ssy {}'.format(func_gen))
+
+        # wait for the next response, which should be the soft sync
+        # we don't DO anything after this, just return.
+        resp = self.read()
+        if resp != '#{:02d}'.format(func_gen):
+            raise RuntimeError('expected soft sync response, got: ' + resp)
 
     def write(self, cmd):
         '''
