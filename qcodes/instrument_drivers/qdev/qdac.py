@@ -23,7 +23,7 @@ class QDac(VisaInstrument):
 
     current_range_map = {'pA': 0, 'nA': 1}
 
-    channel_validator = vals.ints(1, num_chans)
+    channel_validator = vals.Ints(1, num_chans)
 
     # set nonzero value (seconds) to accept older status when reading settings
     max_status_age = 1
@@ -119,6 +119,8 @@ class QDac(VisaInstrument):
                           parameters=[vals.Numbers(1, 268435455),
                                       vals.Anything()])
 
+        # self.add_function
+
         # not to be implemented:
         # boa, tri (service), val, upd, sin (obsolete)
 
@@ -127,6 +129,7 @@ class QDac(VisaInstrument):
         # nice interface to waveforms
 
         self.verbose.set(False)
+        self.get_status()
 
     def _num_verbose(self, s):
         '''
@@ -191,7 +194,7 @@ class QDac(VisaInstrument):
             line = self.read().strip()
             if not line:
                 continue
-            chan, v, _, vrange, irange = line.split('\t')
+            chan, v, _, vrange, _, irange = line.split('\t')
             chan = int(chan)
             v = float(v)
             vrange = self.voltage_range_status[vrange.strip()]
